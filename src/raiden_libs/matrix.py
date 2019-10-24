@@ -1,6 +1,7 @@
 import sys
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Union
+from urllib.parse import urlparse
 
 import gevent
 import structlog
@@ -17,7 +18,7 @@ from monitoring_service.constants import (
 from raiden.constants import Environment
 from raiden.exceptions import SerializationError, TransportError
 from raiden.messages.abstract import Message, SignedMessage
-from raiden.network.transport.matrix.client import Room
+from raiden.network.transport.matrix.client import GMatrixClient, Room
 from raiden.network.transport.matrix.utils import (
     AddressReachability,
     UserAddressManager,
@@ -147,7 +148,7 @@ class MatrixListener(gevent.Greenlet):
             http_retry_timeout=40,
             http_retry_delay=matrix_http_retry_delay,
         )
-        self.broadcast_room: Optional[Room] = None
+        self.broadcast_rooms: List[Room] = []
         self.user_manager: Optional[UserAddressManager] = None
 
         if address_reachability_changed_callback is not None:
@@ -191,14 +192,13 @@ class MatrixListener(gevent.Greenlet):
             raise ConnectionError("Could not login/register to matrix.")
 
         try:
-            room_name = make_room_alias(self.chain_id, self.service_room_suffix)
-            self.broadcast_room = join_global_room(
-                client=self.client, name=room_name, servers=self.available_servers
-            )
+            self.join_global_rooms(client=self.client, available_servers=self.available_servers)
         except (MatrixRequestError, TransportError):
             raise ConnectionError("Could not join monitoring broadcasting room.")
 
-        self.broadcast_room.add_listener(self._handle_message, "m.room.message")
+        # Add listener for global rooms
+        for broadcast_room in self.broadcast_rooms:
+            broadcast_room.add_listener(self._handle_message, "m.room.message")
 
         # Signal that startup is finished
         self.startup_finished.set()
@@ -221,18 +221,17 @@ class MatrixListener(gevent.Greenlet):
     def _get_user(self, user: Union[User, str]) -> User:
         """Creates an User from an user_id, if none, or fetch a cached User """
         user_id: str = getattr(user, "user_id", user)
-        if (
-            self.broadcast_room
-            and user_id in self.broadcast_room._members  # pylint: disable=protected-access
-        ):
-            duser: User = self.broadcast_room._members[user_id]  # pylint: disable=protected-access
+        for broadcast_room in self.broadcast_rooms:
+            if user_id in broadcast_room._members:  # pylint: disable=protected-access
+                duser: User = broadcast_room._members[user_id]  # pylint: disable=protected-access
 
-            # if handed a User instance with displayname set, update the discovery room cache
-            if getattr(user, "displayname", None):
-                assert isinstance(user, User)
-                duser.displayname = user.displayname
-            user = duser
-        elif not isinstance(user, User):
+                # if handed a User instance with displayname set, update the discovery room cache
+                if getattr(user, "displayname", None):
+                    assert isinstance(user, User)
+                    duser.displayname = user.displayname
+                user = duser
+                break
+        else:
             user = self.client.get_user(user_id)
 
         return user
@@ -274,3 +273,51 @@ class MatrixListener(gevent.Greenlet):
             self.message_received_callback(message)
 
         return True
+
+    def join_global_rooms(
+        self, client: GMatrixClient, available_servers: Sequence[str] = ()
+    ) -> None:
+        """Join or create a global public room with given name on all available servers.
+        If can't, create a public room with the name on each server.
+
+        Params:
+            client: matrix-python-sdk client instance
+            servers: optional: sequence of known/available servers to try to find the room in
+        """
+        room_alias_prefix = make_room_alias(self.chain_id, self.service_room_suffix)
+
+        parsed_servers = [
+            urlparse(s).netloc for s in available_servers if urlparse(s).netloc not in {None, ""}
+        ]
+
+        for server in parsed_servers:
+            room_alias_full = f"#{room_alias_prefix}:{server}"
+            log.debug("Trying to join pathfinding room", room_alias_full=room_alias_full)
+            try:
+                broadcast_room = client.join_room(room_alias_full)
+                log.debug("Joined pathfinding room", room=broadcast_room)
+                self.broadcast_rooms.append(broadcast_room)
+            except MatrixRequestError as ex:
+                if ex.code is not 404:
+                    log.debug(
+                        "Could not join pathfinding room, trying to create one",
+                        room_alias_full=room_alias_full,
+                    )
+                    try:
+                        global_room = client.create_room(room_alias_full, is_public=True)
+                        log.debug("Created pathfinding room", room=broadcast_room)
+                        self.broadcast_rooms.append(global_room)
+                    except MatrixRequestError:
+                        log.debug(
+                            "Could neither join nor create a global room",
+                            room_alias_full=room_alias_full,
+                        )
+                        TransportError("Could neither join nor create a global room")
+                        raise
+                else:
+                    log.debug(
+                        "Could not join global room",
+                        room_alias_full=room_alias_full,
+                        _exception=ex,
+                    )
+                    raise
